@@ -20,9 +20,10 @@
 // TODO list:
 // * Write automated tests!
 // * Optimise: move as much as possible to compile-time constants
+// * Optimise: investigate using an IIR filter for decimation (performance)
 // * Store failed RX messages for investigation (above certain power level)
 // * Figure out why some of the messages fail to decode with enough SNR
-// * Investigate using an IIR filter for decimation (performance)
+// * Measure and report SNR
 // * Port and test-run on a RPi
 // * Figure out the issue with linear regression
 // * Collect and output channel statistics
