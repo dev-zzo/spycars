@@ -6,14 +6,15 @@
 #include <time.h>
 #include <string.h>
 #include <malloc.h>
-#include <getopt.h>
 
 #ifdef _WIN32
 #include <WinSock2.h>
 #include <Ws2tcpip.h>
 #include <Windows.h>
+#include <src\win32\getopt.h>
 #else
 #include <netinet/in.h>
+#include <getopt.h>
 #endif
 
 // TODO list:
