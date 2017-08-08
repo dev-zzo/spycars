@@ -28,7 +28,7 @@
 // * Figure out the issue with linear regression
 // * Collect and output channel statistics
 
-#define DEBUG_DUMP_CSV_DATA
+//#define DEBUG_DUMP_CSV_DATA
 //#define DEBUG_WRITE_RAW_IF
 
 //
@@ -235,10 +235,10 @@ typedef struct _acars_header_t {
 // Receiver definitions
 //
 
-#define RECEIVER_BASEBAND_OVERSAMPLE 32
+#define RECEIVER_BASEBAND_OVERSAMPLE 16
 #define RECEIVER_BASEBAND_SAMPLE_RATE (ACARS_SYMBOL_RATE * RECEIVER_BASEBAND_OVERSAMPLE)
 #define RECEIVER_BASEBAND_SAMPLES_PER_BIT (RECEIVER_BASEBAND_OVERSAMPLE)
-#define RECEIVER_IF_FILTER_CUTOFF (RECEIVER_BASEBAND_SAMPLE_RATE)
+#define RECEIVER_IF_FILTER_CUTOFF (RECEIVER_BASEBAND_SAMPLE_RATE / 2)
 #define RECEIVER_BASEBAND_FILTER_CUTOFF (ACARS_SYMBOL_RATE * 1.414f)
 #define RECEIVER_PHASE_ESTIMATE_COUNT 48
 #define RECEIVER_PHASE_MEASUREMENTS_MAX 512
@@ -310,8 +310,6 @@ typedef struct _channel_t {
     // DC offset cancellation in baseband
     real_t dc_measurements[RECEIVER_DC_MEASUREMENTS_MAX];
     unsigned dc_measurements_index;
-    real_t nf_measurements[RECEIVER_DC_MEASUREMENTS_MAX];
-    unsigned nf_measurements_index;
     real_t dc;
     // MSK demod state
     msk_state_t msk_state;
@@ -447,7 +445,7 @@ int hamming_distance(unsigned a, unsigned b)
     return popcount;
 }
 
-static void acars_write_to_file(FILE *fp, const char *msg, unsigned msg_length)
+static void acars_write_to_file(FILE *fp, const char *msg, unsigned msg_length, unsigned fc)
 {
     const acars_header_t *header = (acars_header_t *)msg;
     char eom = msg[msg_length - 1];
@@ -456,7 +454,7 @@ static void acars_write_to_file(FILE *fp, const char *msg, unsigned msg_length)
 
     tm = time(NULL);
     strftime(timestamp, sizeof(timestamp), "%Y%m%dT%H%M%SZ", gmtime(&tm));
-    fprintf(fp, "-------------------------------------------[ %s ]--\r\n", timestamp);
+    fprintf(fp, "--[ %d ]-----------------------------------------[ %s ]--\r\n", fc / 1000, timestamp);
 
     fprintf(fp, "ACARS mode: %c  ", header->mode);
     if (header->aircraft_reg[0]) {
@@ -525,10 +523,10 @@ static void acars_process_message(receiver_t *recv, channel_t *chan)
     }
     // Fire up all the writers
     if (recv->screen_output_enabled) {
-        acars_write_to_file(stdout, (const char *)&chan->message_buffer[0], length);
+        acars_write_to_file(stdout, (const char *)&chan->message_buffer[0], length, chan->fc);
     }
     if (recv->output_log_fp) {
-        acars_write_to_file(recv->output_log_fp, (const char *)&chan->message_buffer[0], length);
+        acars_write_to_file(recv->output_log_fp, (const char *)&chan->message_buffer[0], length, chan->fc);
     }
     if (recv->output_socket_fd != -1) {
         acars_send_to_fd(recv, chan, (const char *)&chan->message_buffer[0], length);
@@ -830,7 +828,7 @@ static int channel_compute_phase_adjustment(channel_t *chan, const real_t *bb_sa
     // Locate the zero crossing
     for (i = RECEIVER_BASEBAND_SAMPLES_PER_BIT / 4; i < 3 * RECEIVER_BASEBAND_SAMPLES_PER_BIT / 4; ++i) {
         if ((bb_samples[i] <= 0 && bb_samples[i+1] >= 0) || (bb_samples[i] <= 0 && bb_samples[i+1] >= 0)) {
-            return i - 16;
+            return i - RECEIVER_BASEBAND_SAMPLES_PER_BIT / 2;
         }
     }
     // Somehow failed to locate the zero crossing!
@@ -1076,6 +1074,8 @@ static void channel_state_enter_bit_sync(channel_t *chan)
     chan->msk_state = MSK_STATE_H1;
     chan->sync_reg = 0xFFFF;
     chan->sync_counter = 0;
+
+    chan->dc_measurements_index = 0;
 }
 
 static unsigned channel_state_bit_sync(channel_t *chan, const real_t *bb_samples)
@@ -1178,10 +1178,10 @@ static real_t channel_dc_removal(channel_t *chan, real_t input)
     real_t dc;
     unsigned i;
 
-    // TODO: Optimize: only update the measure, no need to recompute all of it
     i = chan->dc_measurements_index;
     chan->dc_measurements[i] = input;
-    if (i == RECEIVER_DC_MEASUREMENTS_MAX) {
+#if 0
+    if (i == RECEIVER_DC_MEASUREMENTS_MAX - 1) {
         chan->dc_measurements_index = 0;
     } else {
         chan->dc_measurements_index = i + 1;
@@ -1193,6 +1193,21 @@ static real_t channel_dc_removal(channel_t *chan, real_t input)
     }
     dc /= RECEIVER_DC_MEASUREMENTS_MAX;
     chan->dc = dc;
+#else
+    if (i == RECEIVER_DC_MEASUREMENTS_MAX - 1) {
+        chan->dc_measurements_index = 0;
+        dc = 0;
+        for (i = 0; i < RECEIVER_DC_MEASUREMENTS_MAX; ++i) {
+            dc += chan->dc_measurements[i];
+        }
+        dc /= RECEIVER_DC_MEASUREMENTS_MAX;
+        chan->dc = dc;
+    } else {
+        chan->dc_measurements_index = i + 1;
+        dc = chan->dc;
+    }
+
+#endif
 
     return input - dc;
 }
@@ -1320,7 +1335,7 @@ static void receiver_init(receiver_t *recv, unsigned channel_count, unsigned fc,
     recv->if_buffer = (complex_t *)malloc(RECEIVER_IF_BLOCK_LENGTH * sizeof(complex_t));
     recv->baseband_decimate_rate = fs / RECEIVER_BASEBAND_SAMPLE_RATE;
     // Generate the decimation FIR coefficients
-    recv->if_decim_filter_length = (recv->baseband_decimate_rate * 6) | 1;
+    recv->if_decim_filter_length = (recv->baseband_decimate_rate * 3) | 1;
     recv->if_decim_filter = (real_t *)calloc(recv->if_decim_filter_length, sizeof(real_t));
     f_cutoff = _R(RECEIVER_IF_FILTER_CUTOFF) / _R(fs);
     fir_generate_sinc_f32(f_cutoff, recv->if_decim_filter_length, recv->if_decim_filter);
