@@ -28,7 +28,7 @@
 // * Figure out the issue with linear regression
 // * Collect and output channel statistics
 
-//#define DEBUG_DUMP_CSV_DATA
+#define DEBUG_DUMP_CSV_DATA
 //#define DEBUG_WRITE_RAW_IF
 
 //
@@ -106,6 +106,32 @@ void fir_apply_window_f32(unsigned length, real_t *data, window_func_t window)
     for (i = 0; i < length; ++i) {
         data[i] *= window(i, length);
     }
+}
+
+real_t fir_convolve_symmetric_rr(const real_t *x, const real_t *h, unsigned length)
+{
+    unsigned i;
+    real_t y = _R(0);
+
+    for (i = 0; i < length; ++i) {
+        y += x[i] * h[i];
+    }
+
+    return y;
+}
+
+complex_t fir_convolve_symmetric_cr(const complex_t *x, const real_t *h, unsigned length)
+{
+    unsigned i;
+    complex_t y;
+
+    y.re = _R(0); y.im = _R(0);
+    for (i = 0; i < length; ++i) {
+        y.re += x[i].re * h[i];
+        y.im += x[i].im * h[i];
+    }
+
+    return y;
 }
 
 real_t fir_convolve_wrapped(const real_t *x, unsigned offset, const real_t *h, unsigned length)
@@ -219,6 +245,7 @@ typedef struct _acars_header_t {
 #define RECEIVER_DC_MEASUREMENTS_MAX (RECEIVER_BASEBAND_SAMPLES_PER_BIT * 8)
 #define RECEIVER_CORRECTABLE_ERRORS_MAX 5
 #define RECEIVER_STATION_ID_LENGTH 8
+#define RECEIVER_IF_BLOCK_LENGTH (1 << 18)
 
 typedef enum _channel_state_t {
     // Default state where pre-key tone is detected
@@ -264,10 +291,9 @@ typedef struct _channel_t {
     // DDC multiplier value
     complex_t ddc_dw;
     // DDC decimation filter's input
-    real_t *if_decim_filter_i;
-    real_t *if_decim_filter_q;
+    complex_t *if_buffer;
     // DDC decimation filter input's x[0] position
-    unsigned if_decim_filter_index;
+    unsigned if_buffer_index;
     // DDC decimation counter
     unsigned if_decim_counter;
     // Baseband AM samples before BB filter
@@ -326,8 +352,7 @@ typedef struct _receiver_t {
     unsigned baseband_filter_length;
     uint8_t station_id[RECEIVER_STATION_ID_LENGTH];
     // Stuff that changes
-    real_t *if_buffer_i;
-    real_t *if_buffer_q;
+    complex_t *if_buffer;
     // Output configuration
     uint8_t screen_output_enabled;
     FILE *output_log_fp;
@@ -1175,59 +1200,64 @@ static real_t channel_dc_removal(channel_t *chan, real_t input)
 static void channel_process_if(receiver_t *recv, channel_t *chan, unsigned count)
 {
     unsigned i;
-    real_t ddc_re, ddc_im;
-    unsigned decim_index, decim_counter;
-    // Cache some state variables to avoid back-and-forth memory accesses
-    ddc_re = chan->ddc_w.re;
-    ddc_im = chan->ddc_w.im;
-    decim_index = chan->if_decim_filter_index;
-    decim_counter = chan->if_decim_counter;
-    // IF samples processing loop
+    complex_t ddc_w, ddc_dw;
+    unsigned if_buffer_index;
+    unsigned limit;
+
+    // Run DDC stage
+    if_buffer_index = chan->if_buffer_index;
+    ddc_w = chan->ddc_w;
+    ddc_dw = chan->ddc_dw;
     for (i = 0; i < count; ++i) {
-        real_t xi = recv->if_buffer_i[i];
-        real_t xq = recv->if_buffer_q[i];
+        real_t tmp_re, tmp_im;
+        complex_t x = recv->if_buffer[i];
         // DDC mixing
-        chan->if_decim_filter_i[decim_index] = xi * ddc_re - xq * ddc_im;
-        chan->if_decim_filter_q[decim_index] = xi * ddc_im + xq * ddc_re;
+        chan->if_buffer[if_buffer_index].re = x.re * ddc_w.re - x.im * ddc_w.im;
+        chan->if_buffer[if_buffer_index].im = x.re * ddc_w.im + x.im * ddc_w.re;
+        if_buffer_index++;
         // Update DDC state
-        {
-            real_t ti = ddc_re, tq = ddc_im;
-            ddc_re = ti * chan->ddc_dw.re - tq * chan->ddc_dw.im;
-            ddc_im = ti * chan->ddc_dw.im + tq * chan->ddc_dw.re;
-        }
-        // Update decimator counter
-        decim_counter++;
-        if (decim_counter == recv->baseband_decimate_rate) {
-            real_t A;
-            // Apply the decimation FIR
-            xi = fir_convolve_wrapped(chan->if_decim_filter_i, decim_index, recv->if_decim_filter, recv->if_decim_filter_length);
-            xq = fir_convolve_wrapped(chan->if_decim_filter_q, decim_index, recv->if_decim_filter, recv->if_decim_filter_length);
-            // AM demodulate
-            A = hypotf(xi, xq);
-            // Apply the baseband FIR
-            chan->baseband_am_unfiltered[chan->baseband_am_unfiltered_index] = A;
-            A = fir_convolve_wrapped(chan->baseband_am_unfiltered, chan->baseband_am_unfiltered_index, recv->baseband_filter, recv->baseband_filter_length);
-            chan->baseband_am_unfiltered_index = (chan->baseband_am_unfiltered_index == recv->baseband_filter_length - 1) ? 0 : (chan->baseband_am_unfiltered_index + 1);
-            // DC removal
-            A = channel_dc_removal(chan, A);
-            // Finally store the baseband sample
-            chan->baseband_am[chan->baseband_am_index++] = A;
-            decim_counter = 0;
-        }
-        decim_index = (decim_index == recv->if_decim_filter_length - 1) ? 0 : (decim_index + 1);
+        tmp_re = ddc_w.re; tmp_im = ddc_w.im;
+        ddc_w.re = tmp_re * ddc_dw.re - tmp_im * ddc_dw.im;
+        ddc_w.im = tmp_re * ddc_dw.im + tmp_im * ddc_dw.re;
     }
     // Normalize the length of the DDC phasor
     // Due to multiplicative errors, the length drifts
     {
-        real_t n = hypotf(ddc_re, ddc_im);
-        ddc_re /= n;
-        ddc_im /= n;
+        real_t n = _R(1) / hypotf(ddc_w.re, ddc_w.im);
+        ddc_w.re *= n;
+        ddc_w.im *= n;
     }
-    // Persist the state
-    chan->ddc_w.re = ddc_re;
-    chan->ddc_w.im = ddc_im;
-    chan->if_decim_filter_index = decim_index;
-    chan->if_decim_counter = decim_counter;
+    chan->ddc_w = ddc_w;
+
+    // Run decimation and AM demod stage
+    for (i = 0; i < if_buffer_index; i += recv->baseband_decimate_rate) {
+        complex_t x;
+        real_t A;
+        x = fir_convolve_symmetric_cr(&chan->if_buffer[i], recv->if_decim_filter, recv->if_decim_filter_length);
+        // AM demodulate
+        A = hypotf(x.re, x.im);
+        chan->baseband_am_unfiltered[chan->baseband_am_unfiltered_index++] = A;
+    }
+    // Preserve the remainder
+    i -= recv->baseband_decimate_rate;
+    if_buffer_index -= i;
+    memmove(&chan->if_buffer[0], &chan->if_buffer[i], if_buffer_index * sizeof(chan->if_buffer[0]));
+    chan->if_buffer_index = if_buffer_index;
+
+    // Run baseband FIR and DC removal
+    if (chan->baseband_am_unfiltered_index < recv->baseband_filter_length) {
+        return;
+    }
+    limit = chan->baseband_am_unfiltered_index - recv->baseband_filter_length;
+    for (i = 0; i < limit; ++i) {
+        real_t A;
+        A = fir_convolve_symmetric_rr(&chan->baseband_am_unfiltered[i], recv->baseband_filter, recv->baseband_filter_length);
+        A = channel_dc_removal(chan, A);
+        chan->baseband_am[chan->baseband_am_index++] = A;
+    }
+    chan->baseband_am_unfiltered_index -= i;
+    memmove(&chan->baseband_am_unfiltered[0], &chan->baseband_am_unfiltered[i], chan->baseband_am_unfiltered_index * sizeof(chan->baseband_am_unfiltered[0]));
+
     channel_process_am_baseband(recv, chan);
 }
 
@@ -1244,15 +1274,11 @@ static void receiver_process_if(receiver_t *recv, unsigned count)
 static void receiver_process_samples_u8u8(receiver_t *recv, const uint8_t *buf, unsigned count)
 {
     unsigned i;
-    recv->if_buffer_i = (real_t *)malloc(sizeof(real_t) * count);
-    recv->if_buffer_q = (real_t *)malloc(sizeof(real_t) * count);
     for (i = 0; i < count; i++) {
-        recv->if_buffer_i[i] = ((int)buf[i * 2 + 0] - 127) * (1.0f / 128.0f);
-        recv->if_buffer_q[i] = ((int)buf[i * 2 + 1] - 127) * (1.0f / 128.0f);
+        recv->if_buffer[i].re = ((int)buf[i * 2 + 0] - 127) * (1.0f / 128.0f);
+        recv->if_buffer[i].im = ((int)buf[i * 2 + 1] - 127) * (1.0f / 128.0f);
     }
     receiver_process_if(recv, count);
-    free(recv->if_buffer_i);
-    free(recv->if_buffer_q);
 }
 
 //
@@ -1267,54 +1293,47 @@ static void receiver_init_channel(receiver_t *recv, unsigned channel_id, unsigne
 
     // NOTE: allocated by calloc(), no need to set zeros
     chan->fc = fc;
-    chan->if_decim_filter_i = (real_t *)calloc(recv->if_decim_filter_length, sizeof(real_t));
-    chan->if_decim_filter_q = (real_t *)calloc(recv->if_decim_filter_length, sizeof(real_t));
-    chan->ddc_w.re = 1.0;
-    chan->ddc_w.im = 0.0;
+    chan->if_buffer = (complex_t *)calloc(RECEIVER_IF_BLOCK_LENGTH * 2, sizeof(complex_t));
+    chan->ddc_w.re = _R(1);
+    chan->ddc_w.im = _R(0);
     dw = R_TWOPI * _R(fc - recv->fc) / _R(recv->fs);
     chan->ddc_dw.re = cosf(-dw);
     chan->ddc_dw.im = sinf(-dw);
-    chan->baseband_am_unfiltered = (real_t *)calloc(recv->baseband_filter_length, sizeof(real_t));
-    chan->baseband_am = (real_t *)calloc(256000, sizeof(real_t));
+    chan->baseband_am_unfiltered = (real_t *)calloc(RECEIVER_IF_BLOCK_LENGTH * 2, sizeof(real_t));
+    chan->baseband_am = (real_t *)calloc(RECEIVER_IF_BLOCK_LENGTH * 2, sizeof(real_t));
 
 #ifdef DEBUG_DUMP_CSV_DATA
     chan->fp_debug_csv = NULL;
-#endif
-#if 0
-    sprintf(fname, "chan.%u.msgs.log", fc);
-    chan->fp_msglog = fopen(fname, "ab");
-    if (!chan->fp_msglog) {
-        chan->fp_msglog = fopen(fname, "wb");
-    }
 #endif
 
     channel_state_enter_prekey_detect(chan);
 }
 
-static void receiver_init(receiver_t *o, unsigned channel_count, unsigned fc, unsigned fs)
+static void receiver_init(receiver_t *recv, unsigned channel_count, unsigned fc, unsigned fs)
 {
     real_t f_cutoff;
 
-    o->channel_count = channel_count;
-    o->channels = (channel_t *)calloc(channel_count, sizeof(channel_t));
-    o->fc = fc;
-    o->fs = fs;
-    o->baseband_decimate_rate = fs / RECEIVER_BASEBAND_SAMPLE_RATE;
+    recv->channel_count = channel_count;
+    recv->channels = (channel_t *)calloc(channel_count, sizeof(channel_t));
+    recv->fc = fc;
+    recv->fs = fs;
+    recv->if_buffer = (complex_t *)malloc(RECEIVER_IF_BLOCK_LENGTH * sizeof(complex_t));
+    recv->baseband_decimate_rate = fs / RECEIVER_BASEBAND_SAMPLE_RATE;
     // Generate the decimation FIR coefficients
-    o->if_decim_filter_length = (o->baseband_decimate_rate * 6) | 1;
-    o->if_decim_filter = (real_t *)calloc(o->if_decim_filter_length, sizeof(real_t));
+    recv->if_decim_filter_length = (recv->baseband_decimate_rate * 6) | 1;
+    recv->if_decim_filter = (real_t *)calloc(recv->if_decim_filter_length, sizeof(real_t));
     f_cutoff = _R(RECEIVER_IF_FILTER_CUTOFF) / _R(fs);
-    fir_generate_sinc_f32(f_cutoff, o->if_decim_filter_length, o->if_decim_filter);
-    fir_apply_window_f32(o->if_decim_filter_length, o->if_decim_filter, window_blackman);
-    fir_normalize_f32(o->if_decim_filter_length, o->if_decim_filter);
+    fir_generate_sinc_f32(f_cutoff, recv->if_decim_filter_length, recv->if_decim_filter);
+    fir_apply_window_f32(recv->if_decim_filter_length, recv->if_decim_filter, window_blackman);
+    fir_normalize_f32(recv->if_decim_filter_length, recv->if_decim_filter);
     // Generate the baseband FIR coefficients
     // TODO: experiment with filter shapes
-    o->baseband_filter_length = RECEIVER_BASEBAND_OVERSAMPLE | 1;
-    o->baseband_filter = (real_t *)calloc(o->baseband_filter_length, sizeof(real_t));
+    recv->baseband_filter_length = RECEIVER_BASEBAND_OVERSAMPLE | 1;
+    recv->baseband_filter = (real_t *)calloc(recv->baseband_filter_length, sizeof(real_t));
     f_cutoff = _R(RECEIVER_BASEBAND_FILTER_CUTOFF) / _R(RECEIVER_BASEBAND_SAMPLE_RATE);
-    fir_generate_sinc_f32(f_cutoff, o->baseband_filter_length, o->baseband_filter);
-    fir_apply_window_f32(o->baseband_filter_length, o->baseband_filter, window_blackman);
-    fir_normalize_f32(o->baseband_filter_length, o->baseband_filter);
+    fir_generate_sinc_f32(f_cutoff, recv->baseband_filter_length, recv->baseband_filter);
+    fir_apply_window_f32(recv->baseband_filter_length, recv->baseband_filter, window_blackman);
+    fir_normalize_f32(recv->baseband_filter_length, recv->baseband_filter);
 }
 
 //
@@ -1423,7 +1442,7 @@ static int rtlsdr_run(rtlsdr_dev_t *dev, receiver_t *recv)
 {
     int rv;
 
-    rv = rtlsdr_read_async(dev, (rtlsdr_read_async_cb_t)rtlsdr_callback, recv, 8, 0);
+    rv = rtlsdr_read_async(dev, (rtlsdr_read_async_cb_t)rtlsdr_callback, recv, 8, RECEIVER_IF_BLOCK_LENGTH);
     if (rv) {
         fprintf(stderr, "Failed to start sampling\n");
         return 0;
@@ -1449,14 +1468,26 @@ static void rtlsdr_mainloop(receiver_t *recv, int device_index, unsigned sample_
 // File based IQ input support
 //
 
-static void fakesdr_loop(receiver_t *recv)
+static void iqfile_mainloop(receiver_t *recv, const char *path)
 {
-    static uint8_t buffer[32768];
-    while (!feof(recv->raw_fp)) {
+    uint8_t *buffer;
+    size_t buffer_size;
+    FILE *fp;
+
+    buffer_size = RECEIVER_IF_BLOCK_LENGTH * 2;
+    buffer = (uint8_t *)malloc(buffer_size);
+    fp = fopen(path, "rb");
+    if (!fp) {
+        fprintf(stderr, "Could not open the input file\n");
+        return;
+    }
+    while (!feof(fp)) {
         size_t count;
-        count = fread(buffer, 1, 32768, recv->raw_fp);
+        count = fread(buffer, 1, buffer_size, fp);
         receiver_process_samples_u8u8(recv, buffer, count / 2);
     }
+    fclose(fp);
+    free(buffer);
 }
 
 //
@@ -1471,6 +1502,7 @@ static void print_usage(const char *program_path)
     fprintf(stderr, "  -g gain\n\tSet the dongle's gain to the given value in dB; default: 42.1\n");
     fprintf(stderr, "  -p ppm\n\tSet the dongle's freq correction to the given value, in ppm; deafult: 0\n");
     fprintf(stderr, "  -r index\n\tReceive via RTL-SDR dongle with given index\n");
+    fprintf(stderr, "  -q path\n\tReceive via an IQ file with the given path\n");
     fprintf(stderr, "  -S\n\tOutput received messages on the screen\n");
     fprintf(stderr, "  -L path\n\tAppend received messages to the log file\n");
     fprintf(stderr, "  -U host:port\n\tSend received messages to the given address via UDP\n");
@@ -1481,7 +1513,6 @@ typedef enum _input_source_t {
     INPUT_SOURCE_UNDEFINED,
     // Working
     INPUT_SOURCE_RTLSDR,
-    // Not working
     INPUT_SOURCE_IQFILE,
 } input_source_t;
 
@@ -1510,6 +1541,7 @@ int main(int argc, char *argv[], char *envp[])
     char *udp_destination = NULL;
     char *log_destination = NULL;
     char *station_id = NULL;
+    char *iq_path;
 
 #ifdef _WIN32
     win32_socket_init();
@@ -1519,7 +1551,7 @@ int main(int argc, char *argv[], char *envp[])
 
     // Parse option arguments
     do {
-        option = getopt(argc, argv, "vg:p:r:SL:U:I:");
+        option = getopt(argc, argv, "vg:p:r:q:SL:U:I:");
         switch (option) {
         case 'g':
             // Gain, in dB
@@ -1535,9 +1567,14 @@ int main(int argc, char *argv[], char *envp[])
             source = INPUT_SOURCE_RTLSDR;
             rtlsdr_device_index = strtoul(optarg, NULL, 10);
             break;
+        case 'q':
+            source = INPUT_SOURCE_IQFILE;
+            iq_path = optarg;
+            break;
         // Output options
         case 'S':
             screen_output_enabled = 1;
+            break;
         case 'L':
             log_destination = optarg;
             break;
@@ -1635,6 +1672,7 @@ int main(int argc, char *argv[], char *envp[])
         rtlsdr_mainloop(&rx, rtlsdr_device_index, if_sample_rate, fc, gain, ppm_correction);
         break;
     case INPUT_SOURCE_IQFILE:
+        iqfile_mainloop(&rx, iq_path);
         break;
     }
 
