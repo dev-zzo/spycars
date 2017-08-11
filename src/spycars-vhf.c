@@ -1311,7 +1311,7 @@ static void receiver_init_channel(receiver_t *recv, unsigned channel_id, unsigne
     chan->if_buffer = (complex_t *)calloc(RECEIVER_IF_BLOCK_LENGTH * 2, sizeof(complex_t));
     chan->ddc_w.re = _R(1);
     chan->ddc_w.im = _R(0);
-    dw = R_TWOPI * _R(fc - recv->fc) / _R(recv->fs);
+    dw = R_TWOPI * ( _R(fc) - _R(recv->fc)) / _R(recv->fs);
     chan->ddc_dw.re = cosf(-dw);
     chan->ddc_dw.im = sinf(-dw);
     chan->baseband_am_unfiltered = (real_t *)calloc(RECEIVER_IF_BLOCK_LENGTH * 2, sizeof(real_t));
