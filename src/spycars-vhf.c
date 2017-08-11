@@ -14,6 +14,7 @@
 #include <src\win32\getopt.h>
 #else
 #include <netinet/in.h>
+#include <netdb.h>
 #include <getopt.h>
 #endif
 
@@ -506,7 +507,7 @@ static void acars_send_to_fd(receiver_t *recv, channel_t *chan, const char *msg,
     pkt.header.timestamp = htonl(time(NULL));
     pkt.header.fc = htonl(chan->fc);
     memcpy(&pkt.payload[0], msg, msg_length);
-    if (send(recv->output_socket_fd, (char *)&pkt, sizeof(pkt.header) + msg_length, 0) == SOCKET_ERROR) {
+    if (send(recv->output_socket_fd, (char *)&pkt, sizeof(pkt.header) + msg_length, 0) < 0) {
         printf("Failed to send the message over UDP\n");
     }
 }
