@@ -518,6 +518,8 @@ static void acars_send_to_fd(receiver_t *recv, channel_t *chan, const char *msg,
 static int acars_correct_errors(uint8_t *octets, unsigned length, uint16_t starting_crc, uint16_t expected_crc)
 {
     unsigned i, j;
+    uint16_t new_crc;
+    uint8_t octet;
 
     // For each octet, check parity
     // If parity is OK, update the CRC and move to the next one
@@ -527,25 +529,23 @@ static int acars_correct_errors(uint8_t *octets, unsigned length, uint16_t start
     if (i == length) {
         // Means there were no parity errors found before data ended
         return starting_crc == expected_crc;
-    } else {
-        uint16_t new_crc;
-        uint8_t octet = octets[i];
-        for (j = 0; j < 8; ++j) {
-            // Flip the bit
-            octet ^= 1 << j;
-            // Update the CRC
-            new_crc = crc_ccitt_update(starting_crc, octet);
-            // Continue recursively; return if the valid CRC is found
-            if (acars_correct_errors(&octets[i+1], length - (i+1), new_crc, expected_crc)) {
-                // Apply the found value
-                octets[i] = octet;
-                return 1;
-            }
-            // Unflip the bit
-            octet ^= 1 << j;
-        }
-        return 0;
     }
+    octet = octets[i];
+    for (j = 0; j < 8; ++j) {
+        // Flip the bit
+        octet ^= 1 << j;
+        // Update the CRC
+        new_crc = crc_ccitt_update(starting_crc, octet);
+        // Continue recursively; return if the valid CRC is found
+        if (acars_correct_errors(&octets[i+1], length - (i+1), new_crc, expected_crc)) {
+            // Apply the found value
+            octets[i] = octet;
+            return 1;
+        }
+        // Unflip the bit
+        octet ^= 1 << j;
+    }
+    return 0;
 }
 
 static int acars_message_integrity_check(channel_t *chan)
@@ -578,7 +578,11 @@ static int acars_message_integrity_check(channel_t *chan)
     } else {
         // 1. Multiple octets with single bit errors
         printf("Too many errors to be corrected.\n");
-        chan->debug_csv_keep = 1;
+#ifdef DEBUG_DUMP_CSV_DATA
+        if (chan->msk_dw_sum / chan->msk_dw_count > 0.15f) {
+            chan->debug_csv_keep = 1;
+        }
+#endif
     }
     return 0;
 }
@@ -759,7 +763,7 @@ static int acars_push_octet(receiver_t *recv, channel_t *chan, uint8_t octet)
 #endif
             return 0;
         }
-        printf("Message received successfully.\n");
+        //printf("Message received successfully.\n");
         acars_process_message(recv, chan);
         chan->messages_received_successfully++;
         // Done.
@@ -1206,14 +1210,14 @@ static void channel_process_am_baseband(receiver_t *recv, channel_t *chan)
             break;
         }
     }
+    // Preserve the remainder, if any
+    chan->baseband_am_index -= index;
+    memmove(&chan->baseband_am[0], &chan->baseband_am[index], sizeof(real_t) * chan->baseband_am_index);
 #ifdef DEBUG_DUMP_CSV_DATA
     if (chan->fp_debug_csv) {
-        fprintf(chan->fp_debug_csv, "END OF BUFFER\n");
+        fprintf(chan->fp_debug_csv, "END OF BUFFER; REMAINS: %u\n", chan->baseband_am_index);
     }
 #endif
-    // Preserve the remainder, if any
-    memmove(&chan->baseband_am[0], &chan->baseband_am[index], sizeof(real_t) * (chan->baseband_am_index - index));
-    chan->baseband_am_index -= index;
 }
 
 static real_t channel_dc_removal(channel_t *chan, real_t input)
@@ -1288,7 +1292,7 @@ static void channel_process_if(receiver_t *recv, channel_t *chan, unsigned count
     chan->ddc_w = ddc_w;
 
     // Run decimation and AM demod stage
-    for (i = 0; i < if_buffer_index; i += recv->baseband_decimate_rate) {
+    for (i = 0; i + recv->if_decim_filter_length < if_buffer_index; i += recv->baseband_decimate_rate) {
         complex_t x;
         real_t A;
         x = fir_convolve_symmetric_cr(&chan->if_buffer[i], recv->if_decim_filter, recv->if_decim_filter_length);
