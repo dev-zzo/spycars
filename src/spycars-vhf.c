@@ -29,7 +29,7 @@
 // * Figure out the issue with linear regression
 // * Collect and output channel statistics
 
-//#define DEBUG_DUMP_CSV_DATA
+#define DEBUG_DUMP_CSV_DATA
 //#define DEBUG_WRITE_RAW_IF
 
 //
@@ -314,6 +314,8 @@ typedef struct _channel_t {
     real_t dc;
     // MSK demod state
     msk_state_t msk_state;
+    real_t msk_dw_sum;
+    unsigned msk_dw_count;
     // Bit sync state
     uint16_t sync_reg;
     unsigned sync_counter;
@@ -334,6 +336,7 @@ typedef struct _channel_t {
 
 #ifdef DEBUG_DUMP_CSV_DATA
     FILE *fp_debug_csv;
+    int debug_csv_keep;
 #endif
 
 } channel_t;
@@ -512,28 +515,6 @@ static void acars_send_to_fd(receiver_t *recv, channel_t *chan, const char *msg,
     }
 }
 
-static void acars_process_message(receiver_t *recv, channel_t *chan)
-{
-    unsigned i;
-    unsigned length;
-
-    length = chan->message_index;
-    // Clear parity bits as these are no longer needed
-    for (i = 0; i < length; ++i) {
-        chan->message_buffer[i] &= 0x7F;
-    }
-    // Fire up all the writers
-    if (recv->screen_output_enabled) {
-        acars_write_to_file(stdout, (const char *)&chan->message_buffer[0], length, chan->fc);
-    }
-    if (recv->output_log_fp) {
-        acars_write_to_file(recv->output_log_fp, (const char *)&chan->message_buffer[0], length, chan->fc);
-    }
-    if (recv->output_socket_fd != -1) {
-        acars_send_to_fd(recv, chan, (const char *)&chan->message_buffer[0], length);
-    }
-}
-
 static int acars_correct_errors(uint8_t *octets, unsigned length, uint16_t starting_crc, uint16_t expected_crc)
 {
     unsigned i, j;
@@ -597,8 +578,39 @@ static int acars_message_integrity_check(channel_t *chan)
     } else {
         // 1. Multiple octets with single bit errors
         printf("Too many errors to be corrected.\n");
+        chan->debug_csv_keep = 1;
     }
     return 0;
+}
+
+static void acars_process_message(receiver_t *recv, channel_t *chan)
+{
+    const acars_header_t *header = (acars_header_t *)&chan->message_buffer[0];
+    uint16_t label;
+    unsigned i;
+    unsigned length;
+
+    length = chan->message_index;
+    // Clear parity bits as these are no longer needed
+    for (i = 0; i < length; ++i) {
+        chan->message_buffer[i] &= 0x7F;
+    }
+    // Fire up all the writers
+    if (recv->screen_output_enabled) {
+        acars_write_to_file(stdout, (const char *)&chan->message_buffer[0], length, chan->fc);
+    }
+    // Check if it's the kind of message we don't want to keep
+    label = (header->label[0] << 8) | header->label[1];
+    if (label == 0x5351) {
+        return;
+    }
+    // Continue logging
+    if (recv->output_log_fp) {
+        acars_write_to_file(recv->output_log_fp, (const char *)&chan->message_buffer[0], length, chan->fc);
+    }
+    if (recv->output_socket_fd != -1) {
+        acars_send_to_fd(recv, chan, (const char *)&chan->message_buffer[0], length);
+    }
 }
 
 static int acars_push_octet(receiver_t *recv, channel_t *chan, uint8_t octet)
@@ -610,7 +622,6 @@ static int acars_push_octet(receiver_t *recv, channel_t *chan, uint8_t octet)
     if (!chan->ignore_parity) {
         if (!(popcount_table[octet] & 1)) {
             chan->parity_errors++;
-            //printf("WHOA! Parity error! Octet: %02X, pos: %d\n", octet, chan->message_index);
         }
     }
 
@@ -731,12 +742,6 @@ static int acars_push_octet(receiver_t *recv, channel_t *chan, uint8_t octet)
 
     case ACARS_EXPECT_BCS2:
         chan->received_crc |= (uint16_t)octet << 8;
-        if (!acars_message_integrity_check(chan)) {
-#if ACARS_VERBOSE
-            printf("Integrity check failed; RX aborted\n\n");
-#endif
-            return 0;
-        }
         chan->ignore_parity = 0;
         chan->message_state = ACARS_EXPECT_DEL;
         break;
@@ -747,6 +752,12 @@ static int acars_push_octet(receiver_t *recv, channel_t *chan, uint8_t octet)
 #if ACARS_VERBOSE
             printf("Unexpected character (expected DEL); error ignored.\n");
 #endif
+        }
+        if (!acars_message_integrity_check(chan)) {
+#if ACARS_VERBOSE
+            printf("Integrity check failed; RX aborted\n\n");
+#endif
+            return 0;
         }
         printf("Message received successfully.\n");
         acars_process_message(recv, chan);
@@ -790,6 +801,8 @@ static int msk_demodulate(channel_t *chan, const real_t *bb_samples)
     case MSK_STATE_L1:
         // Allowed: H1, L0
         decision_window = corr_L0 - corr_H1;
+        chan->msk_dw_sum += fabs(decision_window);
+        chan->msk_dw_count++;
         if (decision_window > 0) {
             // Switch to L0
             chan->msk_state = MSK_STATE_L0;
@@ -804,6 +817,8 @@ static int msk_demodulate(channel_t *chan, const real_t *bb_samples)
     case MSK_STATE_L0:
         // Allowed: H0, L1
         decision_window = corr_L1 - corr_H0;
+        chan->msk_dw_sum += fabs(decision_window);
+        chan->msk_dw_count++;
         if (decision_window > 0) {
             // Switch to L1
             chan->msk_state = MSK_STATE_L1;
@@ -821,15 +836,22 @@ static int msk_demodulate(channel_t *chan, const real_t *bb_samples)
 
 static int channel_compute_phase_adjustment(channel_t *chan, const real_t *bb_samples)
 {
-    unsigned i;
+    int i;
     // If not in high-freq tone state, return no adjustment
     if (chan->msk_state == MSK_STATE_L1 || chan->msk_state == MSK_STATE_L0) {
         return 0;
     }
     // Locate the zero crossing
     for (i = RECEIVER_BASEBAND_SAMPLES_PER_BIT / 4; i < 3 * RECEIVER_BASEBAND_SAMPLES_PER_BIT / 4; ++i) {
-        if ((bb_samples[i] <= 0 && bb_samples[i+1] >= 0) || (bb_samples[i] <= 0 && bb_samples[i+1] >= 0)) {
-            return i - RECEIVER_BASEBAND_SAMPLES_PER_BIT / 2;
+        int xagz = bb_samples[i] > 0;
+        int xbgz = bb_samples[i+1] > 0;
+        if (xagz != xbgz) {
+            int d = i - RECEIVER_BASEBAND_SAMPLES_PER_BIT / 2 + 1;
+            if (d > 1)
+                return 1;
+            if (d < -1)
+                return -1;
+            return 0;
         }
     }
     // Somehow failed to locate the zero crossing!
@@ -951,6 +973,7 @@ static void channel_abort(channel_t *chan)
     printf("CH %u: RX Triggered: %d; RX Successful: %d\n", chan->fc,
         chan->message_prekey_detected,
         chan->messages_received_successfully);
+    printf("CH %u: MSK decision window avg: %.6f over %u bits\n", chan->fc, chan->msk_dw_sum / chan->msk_dw_count, chan->msk_dw_count);
 }
 
 
@@ -963,7 +986,15 @@ static void channel_state_enter_prekey_detect(channel_t *chan)
     if (chan->fp_debug_csv) {
         fclose(chan->fp_debug_csv);
         chan->fp_debug_csv = NULL;
+        if (chan->debug_csv_keep) {
+            char bufferA[256];
+            char bufferB[256];
+            sprintf(bufferA, "chan.%u.TMP.csv", chan->fc);
+            sprintf(bufferB, "chan.%u.%d.csv", chan->fc, time(NULL));
+            rename(bufferA, bufferB);
+        }
     }
+    chan->debug_csv_keep = 0;
 #endif
 }
 
@@ -1016,7 +1047,7 @@ static void channel_state_enter_prekey_measure(channel_t *chan)
     chan->state = CHANNEL_STATE_PREKEY_MEASURE;
     chan->phase_estimates_index = 0;
 #ifdef DEBUG_DUMP_CSV_DATA
-    sprintf(buffer, "chan.%u.%d.csv", chan->fc, time(NULL));
+    sprintf(buffer, "chan.%u.TMP.csv", chan->fc);
     chan->fp_debug_csv = fopen(buffer, "w");
 #endif
 }
@@ -1071,11 +1102,12 @@ static unsigned channel_state_prekey_measure(channel_t *chan, const real_t *bb_s
 static void channel_state_enter_bit_sync(channel_t *chan)
 {
     chan->state = CHANNEL_STATE_BIT_SYNC;
-    chan->phase_estimates_index = 0;
     chan->msk_state = MSK_STATE_H1;
+    chan->msk_dw_sum = _R(0);
+    chan->msk_dw_count = 0;
     chan->sync_reg = 0xFFFF;
     chan->sync_counter = 0;
-
+    // NOTE: doing this to ensure new neasurements start at bit boundary
     chan->dc_measurements_index = 0;
 }
 
@@ -1103,6 +1135,11 @@ static unsigned channel_state_bit_sync(channel_t *chan, const real_t *bb_samples
         if (chan->sync_counter > 460) {
             printf("CH %u: no bit sync achieved within sane time; RX aborted\n", chan->fc);
             channel_abort(chan);
+#ifdef DEBUG_DUMP_CSV_DATA
+            if (chan->msk_dw_sum / chan->msk_dw_count > 0.3f) {
+                //chan->debug_csv_keep = 1;
+            }
+#endif
         }
     }
     return RECEIVER_BASEBAND_SAMPLES_PER_BIT + channel_compute_phase_adjustment(chan, bb_samples);
@@ -1169,6 +1206,11 @@ static void channel_process_am_baseband(receiver_t *recv, channel_t *chan)
             break;
         }
     }
+#ifdef DEBUG_DUMP_CSV_DATA
+    if (chan->fp_debug_csv) {
+        fprintf(chan->fp_debug_csv, "END OF BUFFER\n");
+    }
+#endif
     // Preserve the remainder, if any
     memmove(&chan->baseband_am[0], &chan->baseband_am[index], sizeof(real_t) * (chan->baseband_am_index - index));
     chan->baseband_am_index -= index;
