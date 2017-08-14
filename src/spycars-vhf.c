@@ -29,7 +29,7 @@
 // * Figure out the issue with linear regression
 // * Collect and output channel statistics
 
-#define DEBUG_DUMP_CSV_DATA
+//#define DEBUG_DUMP_CSV_DATA
 //#define DEBUG_WRITE_RAW_IF
 
 //
