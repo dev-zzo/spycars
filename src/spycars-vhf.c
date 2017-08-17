@@ -236,11 +236,20 @@ typedef struct _acars_header_t {
 // Receiver definitions
 //
 
-#define RECEIVER_BASEBAND_OVERSAMPLE 16
-#define RECEIVER_BASEBAND_SAMPLE_RATE (ACARS_SYMBOL_RATE * RECEIVER_BASEBAND_OVERSAMPLE)
-#define RECEIVER_BASEBAND_SAMPLES_PER_BIT (RECEIVER_BASEBAND_OVERSAMPLE)
+// Minimum sample rate for baseband is 2400 × 2 = 4800 = (2^6 × 3 × 5^2)
+// Channel step is 1kHz = (2^3 × 5^3)
+// The lcm is therefore 2^6 × 3 × 5^3 = 24000
+// In this case:
+// - DDC does an integer number of cycles per channel (e.g. 1 cycle for offset of 12.5kHz
+// - Baseband SR ratio is integer
+
+#define RECEIVER_BASEBAND_OVERSAMPLE 8
+#define RECEIVER_BASEBAND_SAMPLE_RATE (ACARS_SYMBOL_RATE * 2 * RECEIVER_BASEBAND_OVERSAMPLE)
+#define RECEIVER_BASEBAND_SAMPLES_PER_BIT (2 * RECEIVER_BASEBAND_OVERSAMPLE)
 #define RECEIVER_IF_FILTER_CUTOFF (RECEIVER_BASEBAND_SAMPLE_RATE / 2)
 #define RECEIVER_BASEBAND_FILTER_CUTOFF (ACARS_SYMBOL_RATE * 1.414f)
+#define RECEIVER_IF_SAMPLE_RATE 1536000
+
 #define RECEIVER_PHASE_ESTIMATE_COUNT 48
 #define RECEIVER_PHASE_MEASUREMENTS_MAX 512
 #define RECEIVER_DC_MEASUREMENTS_MAX (RECEIVER_BASEBAND_SAMPLES_PER_BIT * 8)
@@ -287,10 +296,10 @@ typedef struct _channel_t {
     // The channel's overall state
     channel_state_t state;
 
-    // DDC phasor state
-    complex_t ddc_w;
-    // DDC multiplier value
-    complex_t ddc_dw;
+    // DDC state
+    complex_t *ddc_w_samples;
+    complex_t *ddc_w_ptr;
+    complex_t *ddc_w_limit;
     // DDC decimation filter's input
     complex_t *if_buffer;
     // DDC decimation filter input's x[0] position
@@ -1183,7 +1192,7 @@ static unsigned channel_state_receive(receiver_t *recv, channel_t *chan, const r
 // Actual DSP implementation
 //
 
-static void channel_process_am_baseband(receiver_t *recv, channel_t *chan)
+static void channel_stage_demod(receiver_t *recv, channel_t *chan)
 {
     unsigned index;
     unsigned advance = RECEIVER_BASEBAND_SAMPLES_PER_BIT;
@@ -1259,40 +1268,43 @@ static real_t channel_dc_removal(channel_t *chan, real_t input)
     return input - dc;
 }
 
-static void channel_process_if(receiver_t *recv, channel_t *chan, unsigned count)
+static void channel_stage_ddc(receiver_t *recv, channel_t *chan, unsigned count)
+{
+    const complex_t *const recv_buffer_limit = &recv->if_buffer[count];
+    const complex_t *recv_if_ptr;
+    const complex_t *ddc_w_ptr;
+    complex_t *chan_if_ptr;
+    unsigned if_buffer_index;
+    unsigned ddc_buffer_index;
+
+    recv_if_ptr = &recv->if_buffer[0];
+    // Run DDC stage
+    ddc_w_ptr = chan->ddc_w_ptr;
+    chan_if_ptr = &chan->if_buffer[chan->if_buffer_index];
+    while (recv_if_ptr < recv_buffer_limit) {
+        // DDC mixing
+        chan_if_ptr->re = recv_if_ptr->re * ddc_w_ptr->re - recv_if_ptr->im * ddc_w_ptr->im;
+        chan_if_ptr->im = recv_if_ptr->re * ddc_w_ptr->im + recv_if_ptr->im * ddc_w_ptr->re;
+        recv_if_ptr++;
+        chan_if_ptr++;
+        ddc_w_ptr++;
+        if (ddc_w_ptr == chan->ddc_w_limit) {
+            ddc_w_ptr = chan->ddc_w_samples;
+        }
+    }
+    // Flush
+    chan->ddc_w_ptr = ddc_w_ptr;
+    chan->if_buffer_index += count;
+}
+
+static void channel_stage_decimate(receiver_t *recv, channel_t *chan)
 {
     unsigned i;
-    complex_t ddc_w, ddc_dw;
-    unsigned if_buffer_index;
     unsigned limit;
-
-    // Run DDC stage
-    if_buffer_index = chan->if_buffer_index;
-    ddc_w = chan->ddc_w;
-    ddc_dw = chan->ddc_dw;
-    for (i = 0; i < count; ++i) {
-        real_t tmp_re, tmp_im;
-        complex_t x = recv->if_buffer[i];
-        // DDC mixing
-        chan->if_buffer[if_buffer_index].re = x.re * ddc_w.re - x.im * ddc_w.im;
-        chan->if_buffer[if_buffer_index].im = x.re * ddc_w.im + x.im * ddc_w.re;
-        if_buffer_index++;
-        // Update DDC state
-        tmp_re = ddc_w.re; tmp_im = ddc_w.im;
-        ddc_w.re = tmp_re * ddc_dw.re - tmp_im * ddc_dw.im;
-        ddc_w.im = tmp_re * ddc_dw.im + tmp_im * ddc_dw.re;
-    }
-    // Normalize the length of the DDC phasor
-    // Due to multiplicative errors, the length drifts
-    {
-        real_t n = _R(1) / hypotf(ddc_w.re, ddc_w.im);
-        ddc_w.re *= n;
-        ddc_w.im *= n;
-    }
-    chan->ddc_w = ddc_w;
-
     // Run decimation and AM demod stage
-    for (i = 0; i + recv->if_decim_filter_length < if_buffer_index; i += recv->baseband_decimate_rate) {
+    // TODO: compare decimate-first and AM-first performance
+    limit = chan->if_buffer_index - recv->if_decim_filter_length;
+    for (i = 0; i < limit; i += recv->baseband_decimate_rate) {
         complex_t x;
         real_t A;
         x = fir_convolve_symmetric_cr(&chan->if_buffer[i], recv->if_decim_filter, recv->if_decim_filter_length);
@@ -1302,11 +1314,15 @@ static void channel_process_if(receiver_t *recv, channel_t *chan, unsigned count
     }
     // Preserve the remainder
     i -= recv->baseband_decimate_rate;
-    if_buffer_index -= i;
-    memmove(&chan->if_buffer[0], &chan->if_buffer[i], if_buffer_index * sizeof(chan->if_buffer[0]));
-    chan->if_buffer_index = if_buffer_index;
+    chan->if_buffer_index -= i;
+    memmove(&chan->if_buffer[0], &chan->if_buffer[i], chan->if_buffer_index * sizeof(chan->if_buffer[0]));
+}
 
-    // Run baseband FIR and DC removal
+static void channel_stage_bb_filtering(receiver_t *recv, channel_t *chan)
+{
+    unsigned i;
+    unsigned limit;
+
     if (chan->baseband_am_unfiltered_index < recv->baseband_filter_length) {
         return;
     }
@@ -1319,8 +1335,14 @@ static void channel_process_if(receiver_t *recv, channel_t *chan, unsigned count
     }
     chan->baseband_am_unfiltered_index -= i;
     memmove(&chan->baseband_am_unfiltered[0], &chan->baseband_am_unfiltered[i], chan->baseband_am_unfiltered_index * sizeof(chan->baseband_am_unfiltered[0]));
+}
 
-    channel_process_am_baseband(recv, chan);
+static void channel_process_if(receiver_t *recv, channel_t *chan, unsigned count)
+{
+    channel_stage_ddc(recv, chan, count);
+    channel_stage_decimate(recv, chan);
+    channel_stage_bb_filtering(recv, chan);
+    channel_stage_demod(recv, chan);
 }
 
 static void receiver_process_if(receiver_t *recv, unsigned count)
@@ -1350,17 +1372,32 @@ static void receiver_process_samples_u8u8(receiver_t *recv, const uint8_t *buf, 
 static void receiver_init_channel(receiver_t *recv, unsigned channel_id, unsigned fc)
 {
     channel_t *chan = &recv->channels[channel_id];
+    unsigned i;
+    unsigned ddc_w_length;
+    real_t ddc_t;
     real_t dw;
+    real_t w_length;
     char fname[256];
 
     // NOTE: allocated by calloc(), no need to set zeros
     chan->fc = fc;
     chan->if_buffer = (complex_t *)calloc(RECEIVER_IF_BLOCK_LENGTH * 2, sizeof(complex_t));
-    chan->ddc_w.re = _R(1);
-    chan->ddc_w.im = _R(0);
-    dw = R_TWOPI * ( _R(fc) - _R(recv->fc)) / _R(recv->fs);
-    chan->ddc_dw.re = cosf(-dw);
-    chan->ddc_dw.im = sinf(-dw);
+    ddc_t = _R(recv->fs) / (_R(fc) - _R(recv->fc));
+    dw = -R_TWOPI / ddc_t;
+    // Determine the length of w samples
+    for (w_length = ddc_t; fabs(w_length - (int)w_length) > 1e-3; w_length += ddc_t)
+        ;
+    ddc_w_length = fabs(w_length);
+    // Allocate and compute the samples
+    chan->ddc_w_samples = (complex_t *)calloc(ddc_w_length, sizeof(complex_t));
+    for (i = 0; i < ddc_w_length; ++i) {
+        chan->ddc_w_samples[i].re = cosf(dw * i);
+        chan->ddc_w_samples[i].im = sinf(dw * i);
+    }
+    printf("CH %u: DDC samples %u\n", chan->fc, ddc_w_length);
+    chan->ddc_w_ptr = &chan->ddc_w_samples[0];
+    chan->ddc_w_limit = &chan->ddc_w_samples[ddc_w_length];
+
     chan->baseband_am_unfiltered = (real_t *)calloc(RECEIVER_IF_BLOCK_LENGTH * 2, sizeof(real_t));
     chan->baseband_am = (real_t *)calloc(RECEIVER_IF_BLOCK_LENGTH * 2, sizeof(real_t));
 
@@ -1381,6 +1418,7 @@ static void receiver_init(receiver_t *recv, unsigned channel_count, unsigned fc,
     recv->fs = fs;
     recv->if_buffer = (complex_t *)malloc(RECEIVER_IF_BLOCK_LENGTH * sizeof(complex_t));
     recv->baseband_decimate_rate = fs / RECEIVER_BASEBAND_SAMPLE_RATE;
+    printf("Receiver IF sample rate %f * %d\n", (float)fs / ACARS_SYMBOL_RATE, ACARS_SYMBOL_RATE);
     // Generate the decimation FIR coefficients
     recv->if_decim_filter_length = (recv->baseband_decimate_rate * 3) | 1;
     recv->if_decim_filter = (real_t *)calloc(recv->if_decim_filter_length, sizeof(real_t));
@@ -1597,7 +1635,6 @@ int main(int argc, char *argv[], char *envp[])
     float gain = 42.1f;
     int channel_count;
     int index;
-    int bb_to_if_sample_rate_factor = 25;
     unsigned if_sample_rate;
     int screen_output_enabled = 0;
     char *udp_destination = NULL;
@@ -1657,10 +1694,6 @@ int main(int argc, char *argv[], char *envp[])
         return 1;
     }
 
-    // TODO: figure out the optimal BB to IF sample rate ratio
-    // Hardcoded for now.
-    if_sample_rate = RECEIVER_BASEBAND_SAMPLE_RATE * bb_to_if_sample_rate_factor;
-
     // Expect the rest of arguments to be frequencies
     if (argc - optind < 2) {
         // Need at least two more options
@@ -1670,7 +1703,7 @@ int main(int argc, char *argv[], char *envp[])
     }
     fc = strtoul(argv[optind], NULL, 10) * 1000;
     channel_count = argc - optind - 1;
-    receiver_init(&rx, channel_count, fc, if_sample_rate);
+    receiver_init(&rx, channel_count, fc, RECEIVER_IF_SAMPLE_RATE);
     for (index = 0; index < channel_count; ++index) {
         unsigned fchan = strtoul(argv[optind + 1 + index], NULL, 10) * 1000;
         receiver_init_channel(&rx, index, fchan);
